@@ -1,0 +1,593 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import numpy as np
+from pymongo import MongoClient
+from datetime import datetime
+import os
+import base64
+import json
+import urllib.request
+import urllib.error
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+MONGO_URI   = "mongodb://localhost:27017/"
+ANTHROPIC_KEY = "YOUR_ANTHROPIC_API_KEY"   # <── paste your key here
+GOAL_DEFAULT  = 1800
+CSV_FILE      = "meal_log.csv"
+
+FOOD_DB = {
+    "Apple": 95, "Banana": 105, "Orange": 62, "Grapes (1 cup)": 104,
+    "Rice (1 cup cooked)": 206, "Roti (1 piece)": 120, "Dal (1 cup)": 180,
+    "Chicken Breast (100g)": 165, "Egg (1 whole)": 78, "Paneer (100g)": 265,
+    "Milk (1 cup)": 149, "Curd/Yogurt (1 cup)": 154, "Oats (1 cup cooked)": 154,
+    "Bread (1 slice)": 79, "Butter (1 tsp)": 36, "Almonds (10 pcs)": 70,
+    "Pasta (1 cup cooked)": 220, "Pizza (1 slice)": 285, "Burger": 354,
+    "Salad (mixed)": 20, "Coffee (black)": 5, "Tea (with milk)": 30,
+    "Protein Bar": 210, "Whey Shake (1 scoop)": 120, "Custom": 0
+}
+
+# ─── MongoDB ──────────────────────────────────────────────────────────────────
+def get_db():
+    try:
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
+        client.server_info()
+        return client["calories_tracker"]
+    except Exception:
+        return None
+
+# ─── CSV fallback ─────────────────────────────────────────────────────────────
+def load_csv():
+    if os.path.exists(CSV_FILE):
+        return pd.read_csv(CSV_FILE)
+    return pd.DataFrame(columns=["date","meal_type","food","calories","quantity"])
+
+def save_csv(df):
+    df.to_csv(CSV_FILE, index=False)
+
+# ─── Anthropic Vision API ─────────────────────────────────────────────────────
+def analyse_food_image(image_path: str) -> dict:
+    """
+    Sends the image to Claude claude-sonnet-4-20250514 vision and returns
+    {"food": str, "calories": int, "explanation": str}
+    """
+    with open(image_path, "rb") as f:
+        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+
+    ext = os.path.splitext(image_path)[1].lower()
+    media_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                 ".png": "image/png",  ".webp": "image/webp"}
+    media_type = media_map.get(ext, "image/jpeg")
+
+    payload = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 300,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image",
+                 "source": {"type": "base64",
+                            "media_type": media_type,
+                            "data": image_data}},
+                {"type": "text",
+                 "text": (
+                    "You are a nutrition expert. Look at this food image and respond ONLY "
+                    "with a JSON object — no extra text, no markdown. Format:\n"
+                    '{"food": "<name of food>", "calories": <integer kcal estimate for one serving>, '
+                    '"explanation": "<one short sentence explaining the estimate>"}'
+                 )}
+            ]
+        }]
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "Content-Type":      "application/json",
+            "x-api-key":         ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+
+    raw = result["content"][0]["text"].strip()
+    # Strip markdown fences if model wraps them
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+# ─── Main App ─────────────────────────────────────────────────────────────────
+class CaloriesTrackerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Calories Tracker")
+        self.root.geometry("1050x720")
+        self.root.configure(bg="#0f0f0f")
+        self.root.resizable(True, True)
+
+        self.db          = get_db()
+        self.using_mongo = self.db is not None
+        self.goal        = GOAL_DEFAULT
+        self.today       = datetime.now().strftime("%Y-%m-%d")
+        self.df          = load_csv() if not self.using_mongo else None
+
+        self._build_ui()
+        self.refresh_today_log()
+
+    # ── Colours ───────────────────────────────────────────────────────────────
+    C = {"BG":"#0f0f0f","CARD":"#1a1a1a","ACCENT":"#f97316",
+         "TEXT":"#f5f5f5","MUTED":"#6b6b6b","GREEN":"#22c55e","RED":"#ef4444"}
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        C = self.C
+
+        # header
+        hdr = tk.Frame(self.root, bg=C["ACCENT"], pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="CALORIE TRACKER",
+                 font=("Courier New",20,"bold"), bg=C["ACCENT"], fg="#0f0f0f").pack()
+        storage = "MongoDB" if self.using_mongo else "CSV Mode"
+        tk.Label(hdr, text=f"{storage}  |  {self.today}",
+                 font=("Courier New",9), bg=C["ACCENT"], fg="#0f0f0f").pack()
+
+        # body
+        body = tk.Frame(self.root, bg=C["BG"])
+        body.pack(fill="both", expand=True, padx=14, pady=10)
+
+        left = tk.Frame(body, bg=C["BG"], width=310)
+        left.pack(side="left", fill="y", padx=(0,12))
+        left.pack_propagate(False)
+
+        right = tk.Frame(body, bg=C["BG"])
+        right.pack(side="left", fill="both", expand=True)
+
+        self._build_left(left)
+        self._build_right(right)
+
+        # ttk style
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure("TCombobox", fieldbackground=C["CARD"], background=C["CARD"],
+                    foreground=C["TEXT"], arrowcolor=C["ACCENT"])
+        s.configure("TNotebook", background=C["BG"], borderwidth=0)
+        s.configure("TNotebook.Tab", background=C["CARD"], foreground=C["TEXT"],
+                    font=("Courier New",10,"bold"), padding=[12,6])
+        s.map("TNotebook.Tab",
+              background=[("selected",C["ACCENT"])],
+              foreground=[("selected","#0f0f0f")])
+        s.configure("Treeview", background=C["CARD"], foreground=C["TEXT"],
+                    fieldbackground=C["CARD"], rowheight=28,
+                    font=("Courier New",10))
+        s.configure("Treeview.Heading", background="#2a2a2a",
+                    foreground=C["ACCENT"], font=("Courier New",10,"bold"))
+
+    def _lbl(self, parent, text, size=9, color=None, bold=False):
+        c = color or self.C["MUTED"]
+        w = "bold" if bold else "normal"
+        tk.Label(parent, text=text, font=("Courier New",size,w),
+                 bg=self.C["BG"], fg=c).pack(anchor="w", pady=(6,1))
+
+    def _section(self, parent, title, pady=(14,3)):
+        tk.Label(parent, text=title, font=("Courier New",8,"bold"),
+                 bg=self.C["BG"], fg=self.C["ACCENT"]).pack(anchor="w", pady=pady)
+
+    def _build_left(self, parent):
+        C = self.C
+
+        # ── Tab selector for Manual vs Image ──────────────────────────────────
+        mode_frame = tk.Frame(parent, bg=C["CARD"], pady=4)
+        mode_frame.pack(fill="x", pady=(0,8))
+        self.mode_var = tk.StringVar(value="manual")
+
+        def set_mode(m):
+            self.mode_var.set(m)
+            manual_frame.pack_forget()
+            image_frame.pack_forget()
+            (manual_frame if m=="manual" else image_frame).pack(fill="x")
+
+        for val,lbl in [("manual","Manual Entry"),("image","Image Upload")]:
+            tk.Radiobutton(mode_frame, text=lbl, variable=self.mode_var, value=val,
+                           command=lambda v=val: set_mode(v),
+                           font=("Courier New",9), bg=C["CARD"], fg=C["TEXT"],
+                           selectcolor=C["ACCENT"], activebackground=C["CARD"],
+                           relief="flat").pack(side="left", padx=10)
+
+        # ── Manual entry ──────────────────────────────────────────────────────
+        manual_frame = tk.Frame(parent, bg=C["BG"])
+        manual_frame.pack(fill="x")
+
+        self._lbl(manual_frame, "Meal Type")
+        self.meal_type_var = tk.StringVar(value="Breakfast")
+        ttk.Combobox(manual_frame, textvariable=self.meal_type_var,
+                     values=["Breakfast","Lunch","Dinner","Snack",
+                             "Pre-workout","Post-workout"],
+                     state="readonly", font=("Courier New",11)
+                     ).pack(fill="x", pady=(0,4))
+
+        self._lbl(manual_frame, "Food Item")
+        self.food_var = tk.StringVar(value="Apple")
+        fc = ttk.Combobox(manual_frame, textvariable=self.food_var,
+                          values=list(FOOD_DB.keys()),
+                          font=("Courier New",11))
+        fc.pack(fill="x", pady=(0,4))
+        fc.bind("<<ComboboxSelected>>", self._on_food_select)
+
+        self._lbl(manual_frame, "Calories (kcal)")
+        self.cal_var = tk.StringVar(value="95")
+        tk.Entry(manual_frame, textvariable=self.cal_var,
+                 font=("Courier New",13,"bold"),
+                 bg=C["CARD"], fg=C["ACCENT"], insertbackground=C["ACCENT"],
+                 relief="flat", bd=6).pack(fill="x", pady=(0,4))
+
+        self._lbl(manual_frame, "Quantity / Servings")
+        self.qty_var = tk.DoubleVar(value=1.0)
+        tk.Spinbox(manual_frame, from_=0.5, to=10.0, increment=0.5,
+                   textvariable=self.qty_var,
+                   font=("Courier New",12), bg=C["CARD"], fg=C["TEXT"],
+                   buttonbackground=C["CARD"], relief="flat"
+                   ).pack(fill="x", pady=(0,8))
+
+        tk.Button(manual_frame, text="+ ADD ENTRY",
+                  command=self.add_entry,
+                  font=("Courier New",11,"bold"), bg=C["ACCENT"], fg="#0f0f0f",
+                  relief="flat", cursor="hand2", pady=8).pack(fill="x")
+
+        # ── Image entry ───────────────────────────────────────────────────────
+        image_frame = tk.Frame(parent, bg=C["BG"])
+        # (not packed initially)
+
+        self._lbl(image_frame, "Meal Type")
+        self.img_meal_var = tk.StringVar(value="Lunch")
+        ttk.Combobox(image_frame, textvariable=self.img_meal_var,
+                     values=["Breakfast","Lunch","Dinner","Snack",
+                             "Pre-workout","Post-workout"],
+                     state="readonly", font=("Courier New",11)
+                     ).pack(fill="x", pady=(0,4))
+
+        # Image preview box
+        self.img_preview = tk.Label(image_frame,
+                                    text="No image selected",
+                                    font=("Courier New",9), bg=C["CARD"], fg=C["MUTED"],
+                                    width=30, height=6, relief="flat")
+        self.img_preview.pack(fill="x", pady=(4,6))
+        self.selected_image_path = None
+
+        tk.Button(image_frame, text="Choose Food Photo",
+                  command=self._pick_image,
+                  font=("Courier New",10), bg=C["CARD"], fg=C["TEXT"],
+                  relief="flat", cursor="hand2", pady=6).pack(fill="x")
+
+        # Result display
+        self.img_result_lbl = tk.Label(image_frame, text="",
+                                       font=("Courier New",9), bg=C["BG"],
+                                       fg=C["TEXT"], wraplength=270, justify="left")
+        self.img_result_lbl.pack(anchor="w", pady=(6,2))
+
+        self.img_cal_var = tk.StringVar(value="")
+        cal_row = tk.Frame(image_frame, bg=C["BG"])
+        cal_row.pack(fill="x")
+        tk.Label(cal_row, text="Detected kcal (editable):",
+                 font=("Courier New",8), bg=C["BG"], fg=C["MUTED"]).pack(anchor="w")
+        tk.Entry(cal_row, textvariable=self.img_cal_var,
+                 font=("Courier New",13,"bold"),
+                 bg=C["CARD"], fg=C["ACCENT"], insertbackground=C["ACCENT"],
+                 relief="flat", bd=6).pack(fill="x", pady=(2,6))
+
+        self.analyse_btn = tk.Button(image_frame, text="Analyse Image",
+                                     command=self._analyse_image,
+                                     font=("Courier New",10,"bold"),
+                                     bg="#3b82f6", fg="#fff",
+                                     relief="flat", cursor="hand2", pady=7)
+        self.analyse_btn.pack(fill="x")
+
+        self.img_food_name = tk.StringVar(value="")
+        tk.Button(image_frame, text="+ ADD TO LOG",
+                  command=self._add_image_entry,
+                  font=("Courier New",11,"bold"), bg=C["ACCENT"], fg="#0f0f0f",
+                  relief="flat", cursor="hand2", pady=8
+                  ).pack(fill="x", pady=(6,0))
+
+        # ── Goal ──────────────────────────────────────────────────────────────
+        self._section(parent, "DAILY GOAL")
+        gr = tk.Frame(parent, bg=C["BG"])
+        gr.pack(fill="x")
+        self.goal_var = tk.IntVar(value=self.goal)
+        tk.Entry(gr, textvariable=self.goal_var, font=("Courier New",12),
+                 bg=C["CARD"], fg=C["TEXT"], insertbackground=C["TEXT"],
+                 relief="flat", bd=6, width=10).pack(side="left")
+        tk.Label(gr, text=" kcal", font=("Courier New",10),
+                 bg=C["BG"], fg=C["MUTED"]).pack(side="left")
+        tk.Button(gr, text="Set", command=self._set_goal,
+                  font=("Courier New",9), bg=C["CARD"], fg=C["ACCENT"],
+                  relief="flat", cursor="hand2", padx=10).pack(side="right")
+
+        # ── Stats ─────────────────────────────────────────────────────────────
+        self._section(parent, "TODAY'S STATS")
+        sc = tk.Frame(parent, bg=C["CARD"], padx=12, pady=10)
+        sc.pack(fill="x")
+        self.total_lbl  = tk.Label(sc, text="Total: 0 kcal",
+                                   font=("Courier New",14,"bold"),
+                                   bg=C["CARD"], fg=C["ACCENT"])
+        self.total_lbl.pack(anchor="w")
+        self.remain_lbl = tk.Label(sc, text="Remaining: 0 kcal",
+                                   font=("Courier New",10),
+                                   bg=C["CARD"], fg=C["GREEN"])
+        self.remain_lbl.pack(anchor="w")
+        self.count_lbl  = tk.Label(sc, text="Entries: 0",
+                                   font=("Courier New",9),
+                                   bg=C["CARD"], fg=C["MUTED"])
+        self.count_lbl.pack(anchor="w")
+
+    def _build_right(self, parent):
+        nb = ttk.Notebook(parent)
+        nb.pack(fill="both", expand=True)
+
+        t1 = tk.Frame(nb, bg=self.C["BG"]); nb.add(t1, text="  Today's Log  ")
+        t2 = tk.Frame(nb, bg=self.C["BG"]); nb.add(t2, text="  Charts  ")
+        t3 = tk.Frame(nb, bg=self.C["BG"]); nb.add(t3, text="  Weekly  ")
+
+        self._build_log_tab(t1)
+        self.chart_frame = tk.Frame(t2, bg=self.C["BG"]); self.chart_frame.pack(fill="both", expand=True)
+        self.week_frame  = tk.Frame(t3, bg=self.C["BG"]); self.week_frame.pack(fill="both", expand=True)
+        self.update_charts()
+        self.update_week_chart()
+
+    def _build_log_tab(self, parent):
+        C = self.C
+        f = tk.Frame(parent, bg=C["BG"])
+        f.pack(fill="both", expand=True, padx=8, pady=8)
+
+        cols = ("Meal","Food","Qty","Calories","Source")
+        self.tree = ttk.Treeview(f, columns=cols, show="headings", height=18)
+        widths = [100,190,50,90,70]
+        for col,w in zip(cols,widths):
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=w, anchor="center")
+
+        sc = ttk.Scrollbar(f, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sc.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sc.pack(side="right", fill="y")
+
+        btn = tk.Frame(parent, bg=C["BG"])
+        btn.pack(fill="x", padx=8, pady=4)
+        tk.Button(btn, text="Delete Selected", command=self.delete_entry,
+                  font=("Courier New",10), bg=C["CARD"], fg=C["RED"],
+                  relief="flat", cursor="hand2", pady=6).pack(side="left", padx=(0,8))
+        tk.Button(btn, text="Refresh Charts", command=self.update_charts,
+                  font=("Courier New",10), bg=C["CARD"], fg=C["ACCENT"],
+                  relief="flat", cursor="hand2", pady=6).pack(side="left")
+
+    # ── Image helpers ─────────────────────────────────────────────────────────
+    def _pick_image(self):
+        path = filedialog.askopenfilename(
+            title="Select food image",
+            filetypes=[("Images","*.jpg *.jpeg *.png *.webp")]
+        )
+        if not path:
+            return
+        self.selected_image_path = path
+        fname = os.path.basename(path)
+        self.img_preview.config(text=f"Selected:\n{fname}", fg=self.C["TEXT"])
+        self.img_result_lbl.config(text="")
+        self.img_cal_var.set("")
+        self.img_food_name.set("")
+
+    def _analyse_image(self):
+        if not self.selected_image_path:
+            messagebox.showwarning("No Image", "Please choose a food photo first.")
+            return
+        if ANTHROPIC_KEY == "YOUR_ANTHROPIC_API_KEY":
+            messagebox.showerror("API Key Missing",
+                "Add your Anthropic API key to the ANTHROPIC_KEY variable in the code.")
+            return
+
+        self.analyse_btn.config(text="Analysing...", state="disabled")
+        self.root.update()
+
+        try:
+            result = analyse_food_image(self.selected_image_path)
+            food = result.get("food","Unknown")
+            cal  = int(result.get("calories", 0))
+            expl = result.get("explanation","")
+
+            self.img_food_name.set(food)
+            self.img_cal_var.set(str(cal))
+            self.img_result_lbl.config(
+                text=f"Food: {food}\nEst. Calories: {cal} kcal\n\n{expl}",
+                fg=self.C["GREEN"]
+            )
+        except Exception as e:
+            self.img_result_lbl.config(text=f"Error: {e}", fg=self.C["RED"])
+        finally:
+            self.analyse_btn.config(text="Analyse Image", state="normal")
+
+    def _add_image_entry(self):
+        food = self.img_food_name.get().strip()
+        cal_str = self.img_cal_var.get().strip()
+        if not food or not cal_str:
+            messagebox.showwarning("Analyse First",
+                "Please select an image and click Analyse Image first.")
+            return
+        try:
+            cal = float(cal_str)
+        except ValueError:
+            messagebox.showerror("Error","Invalid calorie value.")
+            return
+
+        entry = {
+            "date": self.today,
+            "meal_type": self.img_meal_var.get(),
+            "food": food,
+            "calories": cal,
+            "quantity": 1.0,
+            "source": "image"
+        }
+        self._save_entry(entry)
+        self.img_result_lbl.config(text="Added!", fg=self.C["GREEN"])
+
+    # ── CRUD helpers ──────────────────────────────────────────────────────────
+    def _save_entry(self, entry):
+        if self.using_mongo:
+            self.db["meals"].insert_one({k:v for k,v in entry.items()})
+        else:
+            row = pd.DataFrame([entry])
+            self.df = pd.concat([self.df, row], ignore_index=True)
+            save_csv(self.df)
+        self.refresh_today_log()
+
+    def add_entry(self):
+        food = self.food_var.get().strip()
+        try:
+            cal = float(self.cal_var.get())
+            qty = float(self.qty_var.get())
+        except ValueError:
+            messagebox.showerror("Error","Enter valid numbers.")
+            return
+        self._save_entry({
+            "date": self.today, "meal_type": self.meal_type_var.get(),
+            "food": food, "calories": round(cal*qty,1),
+            "quantity": qty, "source": "manual"
+        })
+
+    def delete_entry(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Select Row","Please select a row to delete.")
+            return
+        vals = self.tree.item(sel[0])["values"]
+        food_name = vals[1]
+        if self.using_mongo:
+            self.db["meals"].delete_one({"date":self.today,"food":food_name})
+        else:
+            self.df = load_csv()
+            idx = self.df[(self.df["date"]==self.today)&(self.df["food"]==food_name)].index
+            if len(idx):
+                self.df = self.df.drop(idx[0])
+                save_csv(self.df)
+        self.refresh_today_log()
+
+    # ── Data getters ──────────────────────────────────────────────────────────
+    def _get_today(self):
+        if self.using_mongo:
+            rows = list(self.db["meals"].find({"date":self.today},{"_id":0}))
+            return pd.DataFrame(rows) if rows else pd.DataFrame(
+                columns=["date","meal_type","food","calories","quantity","source"])
+        self.df = load_csv()
+        return self.df[self.df["date"]==self.today]
+
+    def _get_all(self):
+        if self.using_mongo:
+            rows = list(self.db["meals"].find({},{"_id":0}))
+            return pd.DataFrame(rows) if rows else pd.DataFrame(
+                columns=["date","meal_type","food","calories","quantity","source"])
+        return load_csv()
+
+    # ── UI updaters ───────────────────────────────────────────────────────────
+    def refresh_today_log(self):
+        for r in self.tree.get_children():
+            self.tree.delete(r)
+        df = self._get_today()
+        if not df.empty:
+            for _,r in df.iterrows():
+                src = r.get("source","manual")
+                self.tree.insert("","end", values=(
+                    r["meal_type"], r["food"],
+                    f"x{r['quantity']}", f"{r['calories']} kcal",
+                    "IMG" if src=="image" else "-"
+                ))
+        total = df["calories"].sum() if not df.empty else 0
+        rem   = self.goal - total
+        self.total_lbl.config(text=f"Total: {total:.0f} kcal")
+        self.remain_lbl.config(text=f"Remaining: {rem:.0f} kcal",
+                               fg=self.C["RED"] if rem<0 else self.C["GREEN"])
+        self.count_lbl.config(text=f"Entries: {len(df)}")
+
+    def _set_goal(self):
+        self.goal = self.goal_var.get()
+        messagebox.showinfo("Goal Set", f"Daily goal set to {self.goal} kcal!")
+        self.refresh_today_log()
+
+    def _on_food_select(self, _=None):
+        self.cal_var.set(str(FOOD_DB.get(self.food_var.get(), 0)))
+
+    def update_charts(self):
+        for w in self.chart_frame.winfo_children(): w.destroy()
+        df = self._get_today()
+        fig, (ax1,ax2) = plt.subplots(1,2, figsize=(8,3.5), facecolor="#1a1a1a")
+        COLORS = ["#f97316","#22c55e","#3b82f6","#a855f7","#ef4444","#eab308"]
+
+        ax1.set_facecolor("#1a1a1a")
+        if not df.empty:
+            grp = df.groupby("meal_type")["calories"].sum()
+            ax1.pie(grp.values, labels=grp.index, autopct="%1.0f%%",
+                    colors=COLORS[:len(grp)],
+                    textprops={"color":"white","fontsize":9})
+        else:
+            ax1.text(.5,.5,"No data today",ha="center",va="center",
+                     color="#6b6b6b",fontsize=12,transform=ax1.transAxes)
+        ax1.set_title("Calories by Meal Type",color="#f97316",fontsize=11,pad=10)
+
+        ax2.set_facecolor("#1a1a1a")
+        total = df["calories"].sum() if not df.empty else 0
+        rem   = max(self.goal-total,0)
+        bars  = ax2.bar(["Consumed","Remaining"],[total,rem],
+                        color=["#f97316","#22c55e"], width=0.5, edgecolor="none")
+        ax2.spines[:].set_color("#2a2a2a"); ax2.tick_params(colors="white")
+        ax2.set_ylabel("kcal",color="#6b6b6b",fontsize=9)
+        ax2.set_title("Goal Progress",color="#f97316",fontsize=11,pad=10)
+        ax2.axhline(self.goal,color="#ef4444",linestyle="--",linewidth=1,
+                    label=f"Goal: {self.goal}")
+        ax2.legend(fontsize=8,labelcolor="white",framealpha=0)
+        for bar in bars:
+            h=bar.get_height()
+            ax2.text(bar.get_x()+bar.get_width()/2,h+10,f"{h:.0f}",
+                     ha="center",va="bottom",color="white",fontsize=9)
+
+        plt.tight_layout(pad=1.5)
+        canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
+        canvas.draw(); canvas.get_tk_widget().pack(fill="both",expand=True)
+        plt.close(fig)
+
+    def update_week_chart(self):
+        for w in self.week_frame.winfo_children(): w.destroy()
+        df = self._get_all()
+        fig, ax = plt.subplots(figsize=(8,4), facecolor="#1a1a1a")
+        ax.set_facecolor("#1a1a1a")
+        if not df.empty:
+            df["calories"] = pd.to_numeric(df["calories"], errors="coerce")
+            daily = df.groupby("date")["calories"].sum().reset_index().tail(7)
+            x = np.arange(len(daily))
+            bars = ax.bar(x, daily["calories"], color="#f97316",
+                          width=0.6, edgecolor="none")
+            ax.axhline(self.goal,color="#ef4444",linestyle="--",linewidth=1.5,
+                       label=f"Goal: {self.goal} kcal")
+            ax.set_xticks(x)
+            ax.set_xticklabels([d[-5:] for d in daily["date"]],
+                               color="white",fontsize=9)
+            ax.tick_params(colors="white"); ax.spines[:].set_color("#2a2a2a")
+            ax.set_ylabel("Calories (kcal)",color="#6b6b6b")
+            ax.set_title("Last 7 Days",color="#f97316",fontsize=13,pad=12)
+            ax.legend(fontsize=9,labelcolor="white",framealpha=0)
+            for bar,val in zip(bars,daily["calories"]):
+                ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+10,
+                        f"{val:.0f}",ha="center",va="bottom",color="white",fontsize=8)
+        else:
+            ax.text(.5,.5,"No data yet.\nAdd meals to see history!",
+                    ha="center",va="center",color="#6b6b6b",fontsize=12,
+                    transform=ax.transAxes)
+        plt.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self.week_frame)
+        canvas.draw(); canvas.get_tk_widget().pack(fill="both",expand=True)
+        plt.close(fig)
+
+# ─── Run ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    root = tk.Tk()
+    CaloriesTrackerApp(root)
+    root.mainloop()
